@@ -8,10 +8,10 @@ To use the AWS CLI in accounts accessed via SSO, a user must either invoke
 of the user's access in a single call.
 
 For instance, if the user can access a "Sandbox" account (#123456789011) with
-an "Admin" role, it will generate the following profile:
+an "Admin" role, the script will generate the following profile:
 
     [profile sso-sandbox-admin]
-    sso_start_url = https://ORGANIZATION.awsapps.com/start
+    sso_start_url = https://d-1234567890.awsapps.com/start
     sso_account_id = 123456789011
     sso_role_name = Admin
     sso_region = us-east-1
@@ -23,13 +23,16 @@ Which can then be used with the following commands:
     $ aws sso login
     $ aws sts get-caller-identity
 
-Note that the ``~/.aws/config` file will be backed up in case of error. Backups
-should be manually removed.
+Note that the ``~/.aws/config`` file will be backed up in case of error.
+Backups should be manually removed.
 """
+import argparse
 import configparser
+import contextlib
 import json
 import os
 import re
+import sys
 import time
 import webbrowser
 from datetime import datetime, timedelta
@@ -40,41 +43,46 @@ try:
     import boto3
 except ImportError:
     print('Please install boto3:\n\t$ pip install boto3')
-    exit(1)
+    sys.exit(1)
 
 
-ACCESS_PORTAL_URL = 'https://ORGANIZATION.awsapps.com/start'
-AWS_CONFIG_PATH = os.environ.get('AWS_CONFIG_FILE', '.aws/config')
-AWS_SSO_CACHE_PATH = '.aws/sso/cache'
+AWS_SSO_CACHE_PATH = Path.home().joinpath('.aws/sso/cache')
 CLIENT_NAME = 'profile_manager'
-PROFILE_PREFIX = 'grow'
-REGION = 'us-east-1'
 
 
-def configure_profiles(config_path: str = AWS_CONFIG_PATH):
+def configure_profiles(
+    access_portal_url: str,
+    config_path: Path,
+    namespace: str,
+    region: str,
+):
     """Configure the AWS CLI with the current user's SSO profiles."""
-    parent_directory_path, config_file = os.path.split(config_path)
-    parent_directory = Path.home().joinpath(parent_directory_path)
-    parent_directory.mkdir(exist_ok=True, parents=True)
+    parent_directory, _ = os.path.split(config_path)
+    Path(parent_directory).mkdir(exist_ok=True, parents=True)
 
-    print(f'Reading {config_file}...')
-    aws_config_path = parent_directory.joinpath(config_file)
+    print(f'Reading {config_path}...')
     aws_config = configparser.ConfigParser()
     try:
-        with aws_config_path.open() as f:
+        with config_path.open() as f:
             aws_config.read_file(f)
     except FileNotFoundError:
         pass
     else:
         print('Backing up configuration...')
-        with aws_config_path.with_suffix('.bak').open('w') as backup:
+        now = datetime.now().strftime('%Y%m%dT%H%M')
+        with config_path.with_suffix(f'.{now}.bak').open('w') as backup:
             aws_config.write(backup)
 
     print('Logging into AWS...')
-    token = login()
+    token = login(access_portal_url, region)
 
     print('Retrieving accessible accounts and roles...')
-    current_profiles = generate_profiles(token)
+    current_profiles = generate_profiles(
+        token,
+        access_portal_url,
+        namespace,
+        region,
+    )
     for profile_name, profile_config in current_profiles.items():
         aws_config[profile_name] = profile_config
 
@@ -82,33 +90,32 @@ def configure_profiles(config_path: str = AWS_CONFIG_PATH):
     all_sso_profiles = {
         section
         for section in aws_config.sections()
-        if section.startswith(f'profile {PROFILE_PREFIX}')
+        if section.startswith(f'profile {namespace}')
     }
     outdated_profiles = all_sso_profiles - current_profiles.keys()
     for profile_name in outdated_profiles:
         del aws_config[profile_name]
 
-    print(f'Updating {config_file}...')
-    with aws_config_path.open('w') as f:
+    print(f'Updating {config_path}...')
+    with config_path.open('w') as f:
         aws_config.write(f)
 
-    print('Done!')
+    print(f'Done!\nConsider removing backups from {parent_directory}')
 
 
-def login(access_portal_url: str = ACCESS_PORTAL_URL) -> str:
+def login(access_portal_url: str, region: str) -> str:
     """Generate an access token using the AWS access portal's IdP.
 
     Register the current device with IAM Identity Center (aka AWS SSO), then
     open a browser for the user to authorize access. The resulting access token
     can be used for subsequent ``sso`` commands. It will be cached for reuse.
     """
-    cache = Path.home().joinpath(AWS_SSO_CACHE_PATH)
-    cache.mkdir(exist_ok=True, parents=True)
-    cached_token_path = cache.joinpath(f'{CLIENT_NAME}.json')
+    AWS_SSO_CACHE_PATH.mkdir(exist_ok=True, parents=True)
+    cached_token_path = AWS_SSO_CACHE_PATH.joinpath(f'{CLIENT_NAME}.json')
     if (token := _get_cached_token(cached_token_path)) is not None:
         return token
 
-    oidc = boto3.client('sso-oidc', region_name=REGION)
+    oidc = boto3.client('sso-oidc', region_name=region)
     client_credentials = oidc.register_client(
         clientName=CLIENT_NAME,
         clientType='public',
@@ -119,6 +126,7 @@ def login(access_portal_url: str = ACCESS_PORTAL_URL) -> str:
         clientSecret=client_credentials['clientSecret'],
         startUrl=access_portal_url,
     )
+    print(f'\tVerify user code: {device_authorization["userCode"]}')
 
     webbrowser.open(device_authorization['verificationUriComplete'])
 
@@ -147,8 +155,7 @@ def _get_cached_token(cache: Path) -> Optional[str]:
         assert cached_token['expires'] > datetime.now().timestamp()
     except (AssertionError, FileNotFoundError):
         return None
-    else:
-        return cached_token['token']
+    return cached_token['token']
 
 
 def _cache_token(cache: Path, token: str, expires_in: int):
@@ -160,7 +167,9 @@ def _cache_token(cache: Path, token: str, expires_in: int):
 
 def generate_profiles(
     token: str,
-    access_portal: str = ACCESS_PORTAL_URL,
+    access_portal: str,
+    namespace: str,
+    region: str,
 ) -> Dict[str, Dict[str, str]]:
     """Retrieve all AWS accounts the user can access, with their roles.
 
@@ -171,7 +180,7 @@ def generate_profiles(
         https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html
     """
     profiles = {}
-    sso_client = boto3.client('sso', region_name=REGION)
+    sso_client = boto3.client('sso', region_name=region)
     paginator = sso_client.get_paginator('list_accounts')
     for account in paginator.paginate(accessToken=token).search('accountList'):
         account_id = account['accountId']
@@ -184,38 +193,90 @@ def generate_profiles(
         for role in account_roles.get('roleList', []):
             role_name = role['roleName']
 
-            profile_name = _name_profile(account_name, role_name)
+            profile_name = _name_profile(account_name, role_name, namespace)
             profiles[f'profile {profile_name}'] = {
                 'sso_start_url': access_portal,
                 'sso_account_id': account_id,
                 'sso_role_name': role_name,
-                'sso_region': REGION,
-                'region': REGION,
+                'sso_region': region,
+                'region': region,
             }
     return profiles
 
 
-def _name_profile(account_name: str, role_name: str) -> str:
+def _name_profile(account_name: str, role_name: str, namespace: str) -> str:
     """Generate a name for a profile.
 
-    Results will be a lowercased, hyphenated combination of a common prefix,
-    the account name, and the role name.
+    Results will be a lowercased, hyphenated combination of the namespace, the
+    account name, and the role name.
 
     Example:
-        >>> _name_profile('MyAccount', 'Admin')
-        'sso-my-account-admin'
+        >>> _name_profile('MyAccount', 'MyRole')
+        'grow-my-account-my-role'
     """
 
     def _hyphenate(word: str) -> str:
         # Shamelessly adapted from https://github.com/jpvanhal/inflection
-        word = re.sub(r"([A-Z]+)([A-Z][a-z])", r'\1-\2', word)
-        word = re.sub(r"([a-z\d])([A-Z])", r'\1-\2', word)
+        word = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1-\2", word)
+        word = re.sub(r"([a-z\d])([A-Z])", r"\1-\2", word)
         return word.lower()
 
     return '-'.join(
-        [PROFILE_PREFIX, _hyphenate(account_name), _hyphenate(role_name)]
+        [namespace, _hyphenate(account_name), _hyphenate(role_name)]
     )
 
 
+@contextlib.contextmanager
+def unset_aws_env():
+    """Temporarily unset AWS credentials in environment variables."""
+    variables = (
+        name
+        for name in os.environ
+        if name.startswith('AWS') and name != 'AWS_SDK_LOAD_CONFIG'
+    )
+    original_values = {}
+    for variable in variables:
+        original_values[variable] = os.environ.pop(variable, None)
+
+    yield
+    for variable, value in original_values.items():
+        if value is not None:
+            os.environ[variable] = value
+
+
 if __name__ == '__main__':
-    configure_profiles()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        'url',
+        help=(
+            'URL of the AWS access portal '
+            '(eg. https://d-123456.awsapps.com/start)'
+        ),
+    )
+    parser.add_argument(
+        '-n',
+        '--namespace',
+        default='sso',
+        help='Prefix to add to each profile',
+    )
+    parser.add_argument(
+        '-r',
+        '--region',
+        default='us-east-1',
+        help='AWS region for which to configure profiles',
+    )
+    parser.add_argument(
+        '-c',
+        '--config',
+        default=os.path.expanduser('~/.aws/config'),
+        help='Path to AWS config file',
+    )
+    args = parser.parse_args()
+
+    with unset_aws_env():
+        configure_profiles(
+            args.url,
+            Path(args.config),
+            args.namespace,
+            args.region,
+        )
